@@ -1,215 +1,289 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import {
+  ACTIONS,
+  Action,
+  GOAL,
+  GRID_HEIGHT,
+  GRID_WIDTH,
+  Plan,
+  Position,
+  SHIFT_ACTION,
+  SHIFT_SOURCE,
+  START,
+  TinyWorldModel,
+  actualTransition,
+  adaptOnSurprise,
+  cell,
+  createCampusGrid,
+  createEnsemble,
+  planWithModel,
+  predictTransition,
+  samePosition,
+  trainEnsemble,
+} from "./world-model";
 
-type Stage = 0 | 1 | 2 | 3 | 4;
-type Probe = "corridor" | "sign" | "memory" | null;
+type Phase = "ready" | "training" | "trained" | "planned" | "executing" | "door" | "surprise" | "adapting" | "adapted" | "complete";
+type Mismatch = { predicted: Position; observed: Position; collision: number; uncertainty: number } | null;
 
-const stages = [
-  { short: "Brief", title: "Establish the mission" },
-  { short: "Observe", title: "Build a world model" },
-  { short: "Recall", title: "Reason over memory" },
-  { short: "Shift", title: "Detect a changed world" },
-  { short: "Adapt", title: "Choose what to observe next" },
+const projectQuestions = [
+  { code: "REP-01", title: "From grids to pixels", text: "Which latent representation preserves the geometry needed for planning without reconstructing every pixel?" },
+  { code: "CAL-02", title: "Confidently wrong", text: "How should ensemble uncertainty respond to a dynamics shift that every member missed in the same way?" },
+  { code: "ADAPT-03", title: "One-shot dynamics updates", text: "Can a fast adapter absorb a new transition without corrupting the general model?" },
+  { code: "PLAN-04", title: "Search under model error", text: "How should MPC trade goal progress against uncertainty, collision risk, and rollout depth?" },
+  { code: "MEM-05", title: "Partial observability", text: "What belongs in persistent world state when the agent can only see a local observation?" },
+  { code: "SCALE-06", title: "Video world models", text: "Which findings survive when the compact predictor is replaced by an action-conditioned video model?" },
 ];
 
-const traceByStage = [
-  { frame: "READY", time: "—", text: "The agent has no prior map. Its first task is to turn a continuous walk into structured memory.", confidence: 0, tone: "quiet" },
-  { frame: "FRAME 042", time: "00:14", text: "Elevator observed to the right of Room 1045.", confidence: 92, tone: "good" },
-  { frame: "FRAMES 031 · 042", time: "00:31", text: "The Vision Lab is two corridor segments west of the elevator.", confidence: 87, tone: "good" },
-  { frame: "FRAME 118", time: "04:06", text: "New obstacle conflicts with the stored route to the Vision Lab.", confidence: 41, tone: "warn" },
-  { frame: "FRAMES 118 · 126", time: "04:22", text: "The east corridor is blocked. A route through the Student Lounge remains open.", confidence: 84, tone: "good" },
-];
-
-const projects = [
-  { code: "CV-01", division: "Computer Vision", title: "Open-world spatial grounding", question: "Can geometry-aware MLLMs build metrically consistent maps from ordinary phone video?", tags: ["3D vision", "VLMs"] },
-  { code: "CV-02", division: "Computer Vision", title: "Active visual sensing", question: "Can an agent learn which camera movement will resolve its uncertainty fastest?", tags: ["Embodied AI", "RL"] },
-  { code: "NLP-01", division: "Natural Language", title: "Contradiction-aware memory", question: "What should an agent update, preserve, or forget when observations disagree over time?", tags: ["Agent memory", "Reasoning"] },
-  { code: "NLP-02", division: "Natural Language", title: "Evidence-bound answers", question: "Can every spatial claim be traced to the minimum sufficient set of frames?", tags: ["Grounding", "Verification"] },
-  { code: "AML-01", division: "Applied ML", title: "Calibrated active perception", question: "When should a model answer, abstain, retrieve memory, or gather new evidence?", tags: ["Uncertainty", "Decision theory"] },
-  { code: "AML-02", division: "Applied ML", title: "Continual adaptation", question: "Can the agent absorb environmental change without catastrophically rewriting valid memory?", tags: ["Continual learning", "Shift"] },
-];
+const sleep = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
 export default function Home() {
-  const [stage, setStage] = useState<Stage>(0);
-  const [probe, setProbe] = useState<Probe>(null);
-  const [showProjects, setShowProjects] = useState(false);
-  const trace = traceByStage[stage];
-  const resolved = stage === 4 && probe === "corridor";
-  const displayTrace = stage === 4 && !resolved
-    ? { frame: "DECISION POINT", time: "04:12", text: "Stored evidence cannot determine whether an alternate route is open.", confidence: 0, tone: "quiet" }
-    : trace;
+  const grid = useMemo(() => createCampusGrid(), []);
+  const models = useRef<TinyWorldModel[]>([]);
+  const [phase, setPhase] = useState<Phase>("ready");
+  const [epoch, setEpoch] = useState(0);
+  const [lossHistory, setLossHistory] = useState<number[]>([]);
+  const [adaptHistory, setAdaptHistory] = useState<number[]>([]);
+  const [plan, setPlan] = useState<Plan | null>(null);
+  const [position, setPosition] = useState<Position>({ ...START });
+  const [actualPath, setActualPath] = useState<Position[]>([{ ...START }]);
+  const [mismatch, setMismatch] = useState<Mismatch>(null);
+  const [planningMs, setPlanningMs] = useState<number | null>(null);
+  const [worldShifted, setWorldShifted] = useState(false);
+  const [eventLog, setEventLog] = useState<string[]>(["Engine initialized. Parameters are random."]);
 
-  const memoryCount = useMemo(() => {
-    if (stage === 0) return 0;
-    if (stage < 3) return stage + 3;
-    if (stage === 3) return 6;
-    return resolved ? 7 : 6;
-  }, [stage, resolved]);
+  const isBusy = phase === "training" || phase === "executing" || phase === "adapting";
+  const finalLoss = lossHistory.at(-1) ?? null;
+  const parameters = 5 * (models.current[0]?.parameterCount ?? 611);
+  const shifted = worldShifted;
+  const activePlan = plan?.best.path ?? [];
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "ArrowRight" && stage < 4) setStage((stage + 1) as Stage);
-      if (event.key.toLowerCase() === "r") {
-        setStage(0); setProbe(null); setShowProjects(false);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [stage]);
+  const addLog = (message: string) => setEventLog((current) => [message, ...current].slice(0, 5));
 
-  const advance = () => {
-    if (stage < 4) {
-      setStage((stage + 1) as Stage);
-      setProbe(null);
-    } else if (resolved) {
-      setShowProjects(true);
-      window.setTimeout(() => document.getElementById("projects")?.scrollIntoView({ behavior: "smooth" }), 30);
+  async function trainModel() {
+    setPhase("training");
+    setEpoch(0);
+    setLossHistory([]);
+    setPlan(null);
+    setMismatch(null);
+    models.current = createEnsemble(5);
+    addLog("Generated 900 randomized transition samples.");
+    const history = await trainEnsemble(models.current, (nextEpoch, loss) => {
+      setEpoch(nextEpoch);
+      setLossHistory((current) => [...current, loss]);
+    });
+    setLossHistory(history);
+    setPhase("trained");
+    addLog(`Training converged at loss ${history.at(-1)?.toFixed(4)}.`);
+  }
+
+  function createPlan(start = position, horizon = 18) {
+    const began = performance.now();
+    const nextPlan = planWithModel(models.current, grid, start, GOAL, horizon);
+    setPlanningMs(performance.now() - began);
+    setPlan(nextPlan);
+    return nextPlan;
+  }
+
+  function planFutures() {
+    const nextPlan = createPlan(START);
+    setPhase("planned");
+    addLog(`MPC evaluated ${nextPlan.rollouts.toLocaleString()} learned futures.`);
+  }
+
+  async function executeToDoor() {
+    if (!plan) return;
+    setPhase("executing");
+    let current = { ...START };
+    const traversed = [{ ...START }];
+    const doorIndex = plan.best.path.findIndex((item, index) => samePosition(item, SHIFT_SOURCE) && plan.best.actions[index] === SHIFT_ACTION);
+    const stopIndex = doorIndex >= 0 ? doorIndex : Math.min(5, plan.best.actions.length);
+    for (let index = 0; index < stopIndex; index += 1) {
+      const result = actualTransition(grid, current, plan.best.actions[index], false);
+      current = result.next;
+      traversed.push({ ...current });
+      setPosition({ ...current });
+      setActualPath([...traversed]);
+      await sleep(120);
     }
+    setPhase("door");
+    addLog("Agent reached the model’s preferred decision boundary.");
+  }
+
+  function introduceShift() {
+    setWorldShifted(true);
+    const prediction = predictTransition(models.current, grid, position, SHIFT_ACTION);
+    const reality = actualTransition(grid, position, SHIFT_ACTION, true);
+    setMismatch({ predicted: prediction.next, observed: reality.next, collision: prediction.collision, uncertainty: prediction.uncertainty });
+    setActualPath((current) => [...current, { ...reality.next }]);
+    setPhase("surprise");
+    addLog("Prediction error: the newly activated door rejected EAST.");
+  }
+
+  async function adaptAndReplan() {
+    setPhase("adapting");
+    setAdaptHistory([]);
+    await adaptOnSurprise(models.current, grid, (_step, collision) => setAdaptHistory((current) => [...current, collision]));
+    const nextPlan = createPlan(position, 24);
+    setPhase("adapted");
+    addLog(`Fast adapter updated; MPC found an ${nextPlan.best.actions.length}-step alternate route.`);
+  }
+
+  async function executeAdaptedPlan() {
+    if (!plan) return;
+    setPhase("executing");
+    let current = { ...position };
+    const traversed = [...actualPath];
+    for (const action of plan.best.actions) {
+      const result = actualTransition(grid, current, action, true);
+      current = result.next;
+      traversed.push({ ...current });
+      setPosition({ ...current });
+      setActualPath([...traversed]);
+      await sleep(105);
+      if (samePosition(current, GOAL)) break;
+    }
+    setPhase("complete");
+    addLog("Goal reached using only model rollouts after the update.");
+    window.setTimeout(() => document.getElementById("projects")?.scrollIntoView({ behavior: "smooth" }), 350);
+  }
+
+  function primaryAction() {
+    if (phase === "ready") void trainModel();
+    else if (phase === "trained") planFutures();
+    else if (phase === "planned") void executeToDoor();
+    else if (phase === "door") introduceShift();
+    else if (phase === "surprise") void adaptAndReplan();
+    else if (phase === "adapted") void executeAdaptedPlan();
+  }
+
+  const primaryLabel: Record<Phase, string> = {
+    ready: "Train world model",
+    training: `Training ensemble · ${epoch}/48`,
+    trained: "Plan with learned dynamics",
+    planned: "Execute predicted route",
+    executing: "Executing model policy…",
+    door: "Change world + test prediction",
+    surprise: "Adapt on the surprise",
+    adapting: "Updating fast adapter…",
+    adapted: "Execute adapted plan",
+    complete: "Experiment complete",
   };
 
-  const reset = () => { setStage(0); setProbe(null); setShowProjects(false); window.scrollTo({ top: 0, behavior: "smooth" }); };
-
   return (
-    <main className="demo-shell">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">UT</span>
-          <div><strong>UTMIST Research</strong><span>Frontier systems lab</span></div>
-        </div>
-        <div className="top-actions">
-          <span className="keyboard-tip">→ advance&nbsp;&nbsp; R reset</span>
-          <div className="live-chip"><span /> Workshop simulation</div>
-        </div>
+    <main className="lab-shell">
+      <header className="lab-topbar">
+        <div className="lab-brand"><span className="brand-mark">UT</span><div><strong>UTMIST Research</strong><small>World Model Laboratory</small></div></div>
+        <div className="runtime-badge"><i /> LIVE INFERENCE · THIS TAB</div>
       </header>
 
-      <section className="hero-row">
-        <div>
-          <p className="eyebrow">Changing-world campus agent</p>
-          <h1>Can an AI remember a world<br />that won&rsquo;t stay still?</h1>
-          <p className="lede">A live test of spatial intelligence, multimodal memory, and calibrated action.</p>
-        </div>
-        <button className="primary-action" type="button" onClick={advance} disabled={stage === 4 && !resolved}>
-          {stage === 0 ? "Begin traversal" : stage < 4 ? "Next experiment" : "Reveal project ideas"}<span aria-hidden="true">→</span>
-        </button>
+      <section className="lab-hero">
+        <div><p className="eyebrow">Action-conditioned neural world model</p><h1>Learn the dynamics.<br />Imagine the future. Act.</h1><p>Train five independent predictors, search thousands of imagined trajectories, then break their shared assumptions with a changed world.</p></div>
+        <button className="run-button" type="button" onClick={primaryAction} disabled={isBusy || phase === "complete"}>{primaryLabel[phase]}<span>→</span></button>
       </section>
 
-      <nav className="experiment-nav" aria-label="Experiment stages">
-        {stages.map((item, index) => (
-          <button key={item.short} type="button" onClick={() => { setStage(index as Stage); setProbe(null); }} className={index === stage ? "active" : index < stage ? "complete" : ""}>
-            <i>{index < stage ? "✓" : `0${index + 1}`}</i>
-            <span><small>{item.short}</small>{item.title}</span>
-          </button>
-        ))}
-      </nav>
+      <aside className="honesty-strip">
+        <strong>What is real</strong><span>Weights train from random initialization. Every transition prediction, uncertainty estimate, rollout score, and plan is computed live.</span>
+        <strong>What is simplified</strong><span>The observation is a compact occupancy grid—not raw video—so the full experiment runs reliably without a GPU.</span>
+      </aside>
 
-      <section className={`workspace stage-${stage} ${resolved ? "resolved" : ""}`} aria-label="Campus agent simulation">
-        <article className="map-card">
-          <div className="panel-heading">
-            <div><span className="panel-kicker">WORLD MODEL</span><h2>Deerfield Hall · Level 1</h2></div>
-            <span className={`status-pill ${stage >= 3 ? "alert" : ""}`}>{stage === 0 ? "Awaiting observations" : stage >= 3 && !resolved ? "Conflict detected" : `${memoryCount} memories indexed`}</span>
-          </div>
-          <div className="map-stage">
-            <div className="room room-a"><span>Lecture 1030</span></div>
-            <div className="room room-b"><span>Room 1045</span></div>
-            <div className="room room-c"><span>Studio 1060</span></div>
-            <div className="corridor corridor-a" />
-            <div className="corridor corridor-b" />
-            {stage > 0 && <div className={`route-line ${stage >= 3 ? "invalid" : ""}`} />}
-            {resolved && <div className="alternate-route"><b /><i /></div>}
-            <div className={`map-node entrance ${stage > 0 ? "seen" : ""}`}><i>01</i><span>Entrance</span></div>
-            <div className={`map-node lab ${stage > 1 ? "seen" : ""}`}><i>02</i><span>Vision Lab</span></div>
-            <div className={`map-node lounge ${stage > 0 ? "seen" : ""}`}><i>03</i><span>Student Lounge</span></div>
-            <div className={`map-node elevator ${stage > 0 ? "active" : ""}`}><i>04</i><span>Elevator</span></div>
-            {stage >= 3 && <div className="blocked"><i>!</i><span>Unexpected barrier</span></div>}
-            {stage > 0 && <div className={`agent-dot position-${stage}`} aria-label="Agent position"><span /></div>}
-            {stage > 0 && <div className={`map-label label-${stage}`}>{stage === 3 ? "CONFLICT LOCATION" : resolved ? "NEW ROUTE VERIFIED" : "CURRENT OBSERVATION"}</div>}
-            {stage === 0 && <div className="map-empty"><span>NO WORLD MODEL</span><p>Begin the traversal to stream observations.</p></div>}
-            <div className="map-legend"><span><i className="known" /> observed</span><span><i className="route" /> planned path</span>{stage >= 3 && <span><i className="conflict" /> contradiction</span>}</div>
+      <section className="lab-grid">
+        <article className="world-panel panel">
+          <PanelHeader kicker="ACTUAL ENVIRONMENT" title="Two-corridor navigation task" meta={shifted ? "Dynamics shifted" : "Nominal dynamics"} alert={shifted} />
+          <div className="world-stage" role="img" aria-label="Grid world with agent, goal, walls, predicted path, and a changing one-way door">
+            <div className="world-grid" style={{ gridTemplateColumns: `repeat(${GRID_WIDTH}, 1fr)` }}>
+              {Array.from({ length: GRID_WIDTH * GRID_HEIGHT }, (_, index) => {
+                const x = index % GRID_WIDTH;
+                const y = Math.floor(index / GRID_WIDTH);
+                const point = { x, y };
+                const predictedStep = activePlan.findIndex((item) => samePosition(item, point));
+                const actualStep = actualPath.findIndex((item) => samePosition(item, point));
+                const classes = ["world-cell", cell(grid, x, y) ? "wall" : "floor"];
+                if (predictedStep >= 0) classes.push("predicted");
+                if (actualStep >= 0) classes.push("actual");
+                if (samePosition(point, START)) classes.push("start");
+                if (samePosition(point, GOAL)) classes.push("goal");
+                if (samePosition(point, SHIFT_SOURCE)) classes.push("door-cell");
+                if (samePosition(point, position)) classes.push("agent-cell");
+                return <div className={classes.join(" ")} key={`${x}-${y}`} data-step={predictedStep >= 0 ? predictedStep : undefined}>
+                  {samePosition(point, START) && <small>START</small>}
+                  {samePosition(point, GOAL) && <small>GOAL</small>}
+                  {samePosition(point, SHIFT_SOURCE) && <span className={`door-edge ${shifted ? "closed" : ""}`} />}
+                  {samePosition(point, position) && <b className="agent-token"><i /></b>}
+                </div>;
+              })}
+            </div>
+            <div className="world-legend"><span><i className="legend-agent" /> observed state</span><span><i className="legend-plan" /> model rollout</span><span><i className="legend-real" /> executed path</span></div>
           </div>
         </article>
 
-        <aside className="evidence-card">
-          <div className="panel-heading compact">
-            <div><span className="panel-kicker">AGENT TRACE</span><h2>{stage === 0 ? "Evidence, not guesses" : stage === 3 ? "A belief breaks" : resolved ? "Memory revised" : "Grounded inference"}</h2></div>
+        <aside className="model-panel panel">
+          <PanelHeader kicker="LEARNED DYNAMICS" title="Neural ensemble inspector" meta={phase === "ready" ? "Untrained" : phase === "training" ? "Optimizing" : "Weights active"} />
+          <div className="architecture">
+            <div><span>OBS</span><b>15</b><small>state + local map + action</small></div><i>→</i><div><span>LATENT</span><b>32 × 5</b><small>independent MLP ensemble</small></div><i>→</i><div><span>PRED</span><b>3</b><small>Δx · Δy · collision</small></div>
           </div>
-          <div className={`observation-preview view-${stage}`}>
-            <span className="frame-tag">{displayTrace.frame}</span>
-            {stage === 0 ? <div className="camera-ready"><i /><span>CAMERA READY</span></div> : <Scene stage={stage} />}
-            {stage >= 3 && <div className="barrier"><span>ACCESS CLOSED</span></div>}
-            {resolved && <div className="verified-stamp">VERIFIED · 04:22</div>}
+          <div className="metric-grid">
+            <Metric label="Parameters" value={parameters.toLocaleString()} detail="learned, not scripted" />
+            <Metric label="Training data" value="900" detail="random transitions" />
+            <Metric label="Validation MSE" value={finalLoss ? finalLoss.toFixed(4) : "—"} detail={phase === "training" ? `epoch ${epoch}` : "held-out dynamics"} accent={Boolean(finalLoss)} />
+            <Metric label="MPC latency" value={planningMs ? `${planningMs.toFixed(0)} ms` : "—"} detail="on this device" />
           </div>
-          <div className="trace-copy">
-            <span className="trace-time">{displayTrace.time}</span>
-            <p>{displayTrace.text}</p>
-            <div className={`confidence ${displayTrace.tone}`}>
-              <span><i /> Confidence</span><strong>{displayTrace.confidence ? `${displayTrace.confidence}%` : "—"}</strong>
-            </div>
-            {stage >= 3 && <div className="memory-diff"><span>Memory operation</span><code>{resolved ? "UPDATE route_vision_lab" : "HOLD + SEEK_EVIDENCE"}</code></div>}
-          </div>
+          <LossChart values={lossHistory} label="HELD-OUT LOSS" />
         </aside>
       </section>
 
-      <section className="control-deck">
-        <article className="mission-card">
-          <span className="panel-kicker">LIVE PROMPT</span>
-          <h2>{stage === 0 ? "Reach the Vision Lab and remember the route." : stage === 1 ? "What did you observe near Room 1045?" : stage === 2 ? "Plan a route from the elevator to the Vision Lab." : stage === 3 ? "Your remembered route is blocked. What changed?" : resolved ? "Route repaired. What did the agent learn?" : "What should the agent observe next?"}</h2>
-          <p>{stage === 0 ? "The model receives only an egocentric video stream—no floor plan and no privileged coordinates." : stage === 1 ? "The answer must be grounded in a retained visual observation." : stage === 2 ? "The model must compose multiple episodic memories into a spatial answer." : stage === 3 ? "The new frame contradicts a high-confidence memory. Updating too aggressively could erase valid knowledge." : resolved ? "A targeted observation changed one relationship while preserving the rest of the map." : "Choose an information-gathering action. The highest-confidence action is not necessarily the most useful one."}</p>
-        </article>
-
-        <article className="memory-card">
-          <div className="memory-heading"><span className="panel-kicker">MEMORY STREAM</span><span>{memoryCount} active</span></div>
-          <div className="memory-list" aria-live="polite">
-            {stage === 0 && <p className="empty-memory">No memories written yet.</p>}
-            {stage > 0 && <Memory op="ADD" id="m_042" text="Elevator ↔ Room 1045" />}
-            {stage > 1 && <Memory op="ADD" id="m_077" text="Vision Lab west of elevator" />}
-            {stage >= 3 && <Memory op={resolved ? "UPDATE" : "CONFLICT"} id="m_118" text={resolved ? "East corridor blocked" : "Barrier contradicts route"} />}
+      <section className="analysis-grid">
+        <article className="rollout-panel panel">
+          <PanelHeader kicker="MODEL-PREDICTIVE CONTROL" title="Counterfactual rollout search" meta={plan ? `${plan.rollouts.toLocaleString()} transitions` : "Waiting for trained model"} />
+          <div className="candidate-list">
+            {!plan && <div className="empty-state"><span>∿</span><p>Train the model, then let MPC search futures predicted by its learned weights.</p></div>}
+            {plan?.candidates.slice(0, 5).map((candidate, index) => <div className={`candidate ${index === 0 ? "best" : ""}`} key={`${candidate.actions.join("")}-${index}`}>
+              <b>#{index + 1}</b><code>{candidate.actions.slice(0, 12).map((action) => ACTIONS[action].short).join(" ")}{candidate.actions.length > 12 ? " …" : ""}</code>
+              <span>score {candidate.score.toFixed(2)}</span><span>risk {candidate.collisionRisk.toFixed(2)}</span>{index === 0 && <em>SELECTED</em>}
+            </div>)}
           </div>
         </article>
 
-        <article className="decision-card">
-          <span className="panel-kicker">AGENT POLICY</span>
-          {stage < 4 ? (
-            <div className="policy-state"><span>{`0${stage + 1}`}</span><p>{stage === 0 ? "Observe before acting" : stage === 1 ? "Write structured memory" : stage === 2 ? "Retrieve and compose evidence" : "Abstain under contradiction"}</p></div>
-          ) : resolved ? (
-            <div className="policy-result"><strong>Good decision</strong><p>Looking down the corridor maximized expected information gain.</p></div>
-          ) : (
-            <div className="probe-options">
-              <button className={probe === "corridor" ? "selected correct" : ""} onClick={() => setProbe("corridor")}><span>Look down corridor</span><small>High information gain</small></button>
-              <button className={probe === "sign" ? "selected wrong" : ""} onClick={() => setProbe("sign")}><span>Re-read room sign</span><small>Low relevance</small></button>
-              <button className={probe === "memory" ? "selected wrong" : ""} onClick={() => setProbe("memory")}><span>Trust old memory</span><small>No new evidence</small></button>
-              {probe && probe !== "corridor" && <p className="probe-warning">That action leaves the route conflict unresolved. Try gathering evidence about the corridor.</p>}
-            </div>
-          )}
+        <article className={`prediction-panel panel ${phase === "surprise" ? "error" : ""}`}>
+          <PanelHeader kicker="PREDICTION VS. REALITY" title={mismatch ? "A confident model meets a changed world" : "Transition error monitor"} meta={mismatch ? "Out-of-distribution event" : "No mismatch yet"} alert={Boolean(mismatch)} />
+          {mismatch ? <div className="mismatch-grid">
+            <div><span>MODEL PREDICTED</span><strong>({mismatch.predicted.x}, {mismatch.predicted.y})</strong><small>{(100 * (1 - mismatch.collision)).toFixed(1)}% move probability</small></div>
+            <div className="not-equal">≠</div>
+            <div><span>WORLD RETURNED</span><strong>({mismatch.observed.x}, {mismatch.observed.y})</strong><small>door rejected action EAST</small></div>
+            <p>The ensemble agreed with itself—uncertainty {mismatch.uncertainty.toFixed(3)}—and was still wrong. Agreement is not calibration under distribution shift.</p>
+          </div> : <div className="empty-state compact"><span>Δ</span><p>The monitor compares each learned next-state prediction with the environment transition actually observed.</p></div>}
+          {adaptHistory.length > 0 && <div className="adapter-progress"><span>FAST ADAPTER · P(collision)</span><div>{adaptHistory.map((value, index) => <i key={index} style={{ height: `${Math.max(8, value * 100)}%` }} />)}</div><strong>{((adaptHistory.at(-1) ?? 0) * 100).toFixed(1)}%</strong></div>}
+        </article>
+
+        <article className="event-panel panel">
+          <PanelHeader kicker="LIVE EVENT STREAM" title="Nothing up our sleeve" meta="Computed locally" />
+          <ol>{eventLog.map((event, index) => <li key={`${event}-${index}`}><span>{String(eventLog.length - index).padStart(2, "0")}</span><p>{event}</p></li>)}</ol>
         </article>
       </section>
 
-      {showProjects && (
-        <section className="projects-section" id="projects">
-          <div className="projects-intro">
-            <div><p className="eyebrow">The failure is the invitation</p><h2>Six projects hiding inside one demo.</h2></div>
-            <p>A finished application would conceal these gaps. This experiment makes them visible—and turns each one into a tractable investigator question.</p>
-          </div>
-          <div className="project-grid">
-            {projects.map((project, index) => (
-              <article className="project-card" key={project.code} style={{ "--delay": `${index * 70}ms` } as React.CSSProperties}>
-                <div><span>{project.code}</span><small>{project.division}</small></div>
-                <h3>{project.title}</h3><p>{project.question}</p>
-                <footer>{project.tags.map((tag) => <span key={tag}>{tag}</span>)}</footer>
-              </article>
-            ))}
-          </div>
-          <div className="closing-banner"><div><span>YOUR MOVE</span><h3>Which uncertainty would you investigate?</h3></div><button type="button" onClick={reset}>Run the demo again ↻</button></div>
-        </section>
-      )}
+      <section className="method-strip">
+        <div><span>01</span><strong>Fit dynamics</strong><small>s<sub>t</sub>, a<sub>t</sub> → s<sub>t+1</sub></small></div><i>→</i><div><span>02</span><strong>Imagine futures</strong><small>5-model ensemble rollouts</small></div><i>→</i><div><span>03</span><strong>Search actions</strong><small>uncertainty-aware MPC</small></div><i>→</i><div><span>04</span><strong>Compare reality</strong><small>prediction error signal</small></div><i>→</i><div><span>05</span><strong>Adapt + replan</strong><small>fast residual dynamics update</small></div>
+      </section>
+
+      {phase === "complete" && <section className="research-section" id="projects">
+        <div className="research-heading"><div><p className="eyebrow">The demo works. The science is unfinished.</p><h2>Six research projects exposed by the run.</h2></div><p>The small model makes every assumption inspectable. Each limitation scales directly into a frontier problem for visual, language, and applied machine learning.</p></div>
+        <div className="question-grid">{projectQuestions.map((project) => <article key={project.code}><span>{project.code}</span><h3>{project.title}</h3><p>{project.text}</p></article>)}</div>
+        <footer className="research-footer"><div><strong>Scale-up path</strong><span>Replace the 3,055-parameter predictor with JEPA-WM, DINO-WM, or an action-conditioned video diffusion model—the experiment protocol stays the same.</span></div><button onClick={() => window.location.reload()}>Reset all learned state ↻</button></footer>
+      </section>}
     </main>
   );
 }
 
-function Scene({ stage }: { stage: Stage }) {
-  return <><div className="ceiling-line" /><div className="door-shape"><span>1045</span></div><div className="hall-opening" /><div className="floor-line" />{stage === 2 && <div className="evidence-ray"><i /><span>retrieved evidence</span></div>}</>;
+function PanelHeader({ kicker, title, meta, alert = false }: { kicker: string; title: string; meta: string; alert?: boolean }) {
+  return <header className="panel-header"><div><span>{kicker}</span><h2>{title}</h2></div><small className={alert ? "alert" : ""}>{meta}</small></header>;
 }
 
-function Memory({ op, id, text }: { op: string; id: string; text: string }) {
-  return <div className={`memory-row op-${op.toLowerCase()}`}><span>{op}</span><code>{id}</code><p>{text}</p></div>;
+function Metric({ label, value, detail, accent = false }: { label: string; value: string; detail: string; accent?: boolean }) {
+  return <div className={`metric ${accent ? "accent" : ""}`}><span>{label}</span><strong>{value}</strong><small>{detail}</small></div>;
+}
+
+function LossChart({ values, label }: { values: number[]; label: string }) {
+  const maximum = Math.max(...values, 0.18);
+  return <div className="loss-chart"><div><span>{label}</span><small>{values.length ? `${values[0].toFixed(3)} → ${values.at(-1)?.toFixed(3)}` : "awaiting training"}</small></div><figure>{values.length ? values.map((value, index) => <i key={index} style={{ height: `${Math.max(5, (value / maximum) * 100)}%` }} />) : Array.from({ length: 13 }, (_, index) => <i className="placeholder" key={index} style={{ height: `${20 + ((index * 17) % 65)}%` }} />)}</figure></div>;
 }

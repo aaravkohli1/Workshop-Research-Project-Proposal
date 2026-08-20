@@ -1,8 +1,17 @@
-# Changing-World Campus Agent
+# Live World Model Lab
 
-An interactive UTMIST workshop demonstration that turns frontier research gaps into a staged experiment. The agent observes a campus walk, writes spatial memories, plans from recalled evidence, encounters a contradictory observation, and chooses an active-perception action before revealing six potential investigator projects.
+An interactive UTMIST workshop demo that runs a real compact world model entirely in the browser.
 
-## Run locally
+The experiment trains five neural transition predictors from random initialization, uses their action-conditioned rollouts for model-predictive control, introduces a previously unseen dynamics change, measures the resulting prediction error, applies a fast residual update, and replans around the changed transition.
+
+## What is—and is not—being claimed
+
+- Real: learned weights, held-out loss, ensemble predictions, uncertainty, rollout search, environment transitions, online adaptation, and replanning.
+- Simplified: observations are compact occupancy grids and the predictors are small MLPs. This is not a pretrained video world foundation model.
+
+That compact scope makes the complete causal loop visible, reproducible, and reliable during a workshop. The closing section identifies how to scale the same protocol to JEPA-WM, DINO-WM, or action-conditioned video diffusion.
+
+## Run
 
 Requires Node.js 22.13 or later.
 
@@ -11,7 +20,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. Use the on-screen controls, the right-arrow key to advance, or `R` to reset.
+Open `http://localhost:3000` and follow the single experiment button.
 
 ## Validate
 
@@ -19,4 +28,4 @@ Open `http://localhost:3000`. Use the on-screen controls, the right-arrow key to
 npm test
 ```
 
-The experience is self-contained and uses scripted observations, so it remains reliable for a live workshop without cameras, model credentials, or network access.
+The numerical tests verify that the ensemble learns nominal dynamics, that MPC reaches the goal through the initially valid shortcut, and that a one-shot dynamics update causes replanning around the changed edge.

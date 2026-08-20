@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import { headers } from "next/headers";
 import "./globals.css";
 
-const title = "Changing-World Campus Agent | UTMIST Research";
-const description = "An interactive frontier AI demonstration of spatial intelligence, multimodal memory, and calibrated action.";
+const title = "Live World Model Lab | UTMIST Research";
+const description = "Train a real action-conditioned neural ensemble, search its imagined futures with model-predictive control, and watch it adapt when the world changes.";
 
 export async function generateMetadata(): Promise<Metadata> {
   const requestHeaders = await headers();
