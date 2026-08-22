@@ -14,6 +14,14 @@ export const ACTIONS = [
   { label: "west", short: "W", dx: -1, dy: 0 },
 ] as const;
 
+const INPUT_SIZE = 15;
+const HIDDEN_SIZE = 32;
+const OUTPUT_SIZE = 3;
+
+export const ENSEMBLE_SIZE = 5;
+export const PARAMETERS_PER_MODEL =
+  INPUT_SIZE * HIDDEN_SIZE + HIDDEN_SIZE + HIDDEN_SIZE * OUTPUT_SIZE + OUTPUT_SIZE;
+
 export type Grid = number[];
 export type Sample = { input: number[]; target: [number, number, number] };
 export type Prediction = {
@@ -102,8 +110,8 @@ export class SeededRandom {
 }
 
 export class TinyWorldModel {
-  readonly inputSize = 15;
-  readonly hiddenSize = 32;
+  readonly inputSize = INPUT_SIZE;
+  readonly hiddenSize = HIDDEN_SIZE;
   readonly parameterCount: number;
   private w1: Float64Array;
   private b1: Float64Array;
@@ -115,10 +123,10 @@ export class TinyWorldModel {
     const random = new SeededRandom(seed);
     this.w1 = new Float64Array(this.inputSize * this.hiddenSize);
     this.b1 = new Float64Array(this.hiddenSize);
-    this.w2 = new Float64Array(this.hiddenSize * 3);
-    this.b2 = new Float64Array(3);
+    this.w2 = new Float64Array(this.hiddenSize * OUTPUT_SIZE);
+    this.b2 = new Float64Array(OUTPUT_SIZE);
     const scale1 = Math.sqrt(2 / (this.inputSize + this.hiddenSize));
-    const scale2 = Math.sqrt(2 / (this.hiddenSize + 3));
+    const scale2 = Math.sqrt(2 / (this.hiddenSize + OUTPUT_SIZE));
     for (let index = 0; index < this.w1.length; index += 1) this.w1[index] = (random.next() * 2 - 1) * scale1;
     for (let index = 0; index < this.w2.length; index += 1) this.w2[index] = (random.next() * 2 - 1) * scale2;
     this.parameterCount = this.w1.length + this.b1.length + this.w2.length + this.b2.length;
@@ -223,7 +231,7 @@ export function generateDataset(count: number, seed: number): Sample[] {
   return samples;
 }
 
-export function createEnsemble(size = 5): TinyWorldModel[] {
+export function createEnsemble(size = ENSEMBLE_SIZE): TinyWorldModel[] {
   return Array.from({ length: size }, (_, index) => new TinyWorldModel(701 + index * 997));
 }
 

@@ -1,3 +1,4 @@
+/// <reference types="@cloudflare/workers-types" />
 /** Cloudflare Worker entry point for the vinext-starter template. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
@@ -45,3 +46,14 @@ const worker = {
 };
 
 export default worker;
+
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace -- workers-types exposes `env` as `Cloudflare.Env`
+  namespace Cloudflare {
+    // `DB` is optional: `.openai/hosting.json` leaves `d1` unset until a real
+    // binding is injected, which is what `getDb()` checks for at runtime.
+    interface Env {
+      DB?: D1Database;
+    }
+  }
+}

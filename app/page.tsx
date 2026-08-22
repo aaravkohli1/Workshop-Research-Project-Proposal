@@ -3,10 +3,11 @@
 import { useMemo, useRef, useState } from "react";
 import {
   ACTIONS,
-  Action,
+  ENSEMBLE_SIZE,
   GOAL,
   GRID_HEIGHT,
   GRID_WIDTH,
+  PARAMETERS_PER_MODEL,
   Plan,
   Position,
   SHIFT_ACTION,
@@ -36,6 +37,14 @@ const projectQuestions = [
   { code: "SCALE-06", title: "Video world models", text: "Which findings survive when the compact predictor is replaced by an action-conditioned video model?" },
 ];
 
+const siteLinks = [
+  { href: "https://www.utmist.ca/#about-us", label: "About Us" },
+  { href: "https://www.utmist.ca/projects", label: "Projects" },
+  { href: "https://www.utmist.ca/sponsors", label: "Sponsors" },
+  { href: "https://www.utmist.ca/events", label: "Events" },
+  { href: "https://www.utmist.ca/careers", label: "Careers" },
+];
+
 const sleep = (milliseconds: number) => new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
 
 export default function Home() {
@@ -55,7 +64,7 @@ export default function Home() {
 
   const isBusy = phase === "training" || phase === "executing" || phase === "adapting";
   const finalLoss = lossHistory.at(-1) ?? null;
-  const parameters = 5 * (models.current[0]?.parameterCount ?? 611);
+  const parameters = ENSEMBLE_SIZE * PARAMETERS_PER_MODEL;
   const shifted = worldShifted;
   const activePlan = plan?.best.path ?? [];
 
@@ -67,7 +76,7 @@ export default function Home() {
     setLossHistory([]);
     setPlan(null);
     setMismatch(null);
-    models.current = createEnsemble(5);
+    models.current = createEnsemble(ENSEMBLE_SIZE);
     addLog("Generated 900 randomized transition samples.");
     const history = await trainEnsemble(models.current, (nextEpoch, loss) => {
       setEpoch(nextEpoch);
@@ -174,12 +183,18 @@ export default function Home() {
   return (
     <main className="lab-shell">
       <header className="lab-topbar">
-        <div className="lab-brand"><span className="brand-mark">UT</span><div><strong>UTMIST Research</strong><small>World Model Laboratory</small></div></div>
+        <a className="lab-brand" href="https://www.utmist.ca">
+          <span className="brand-mark" aria-hidden="true" />
+          <div><strong>UTMIST Research</strong><small>World Model Laboratory</small></div>
+        </a>
+        <nav className="site-nav">
+          {siteLinks.map((link) => <a key={link.href} href={link.href}>{link.label}</a>)}
+        </nav>
         <div className="runtime-badge"><i /> LIVE INFERENCE · THIS TAB</div>
       </header>
 
       <section className="lab-hero">
-        <div><p className="eyebrow">Action-conditioned neural world model</p><h1>Learn the dynamics.<br />Imagine the future. Act.</h1><p>Train five independent predictors, search thousands of imagined trajectories, then break their shared assumptions with a changed world.</p></div>
+        <div><p className="eyebrow">Action-conditioned neural world model</p><h1>Learn the dynamics.<br /><em>Imagine the future.</em> Act.</h1><p>Train five independent predictors, search thousands of imagined trajectories, then break their shared assumptions with a changed world.</p></div>
         <button className="run-button" type="button" onClick={primaryAction} disabled={isBusy || phase === "complete"}>{primaryLabel[phase]}<span>→</span></button>
       </section>
 
